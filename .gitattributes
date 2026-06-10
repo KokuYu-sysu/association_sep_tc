@@ -1,2 +1,3 @@
-*.rmd linguist-language=R
-*.md linguist-language=html
+*.Rmd linguist-language=R linguist-detectable -linguist-documentation
+*.rmd linguist-language=R linguist-detectable -linguist-documentation
+*.md linguist-language=HTML linguist-detectable -linguist-documentation
