@@ -1,0 +1,2431 @@
+---
+title: "SEP and Thyroid Cancer Incidence in CKB"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+
+# Setup
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(lubridate)
+  library(poLCA)
+  library(ggplot2)
+  library(survival)
+  library(coxme)
+  library(broom)
+  library(tidyr)
+  library(broom.mixed)
+  library(table1)
+  library(flextable)
+  library(officer)
+  library(webshot)
+  library(irr)
+  library(jstable)
+  library(Hmisc)
+  library(scales)
+  library(ggrepel)
+  library(stringr)
+  library(splines)
+  library(forestploter)
+  library(tidyverse)
+  library(sf)
+  library(terra)
+  library(units)
+  library(tmap)
+  library(grid)
+  library(patchwork)
+  library(ggspatial)
+  library(performance)
+})
+
+if (requireNamespace("correlation", quietly = TRUE)) {
+  ci_cor <- correlation::ci_cor
+} else {
+  ci_cor <- function(x, y, method = "spearman", type = "bootstrap",
+                     R = 10000, seed = NULL, boot_type = "bca",
+                     conf.level = 0.95) {
+    if (!is.null(seed)) {
+      set.seed(seed)
+    }
+
+    keep <- complete.cases(x, y)
+    x <- x[keep]
+    y <- y[keep]
+    estimate <- suppressWarnings(cor(x, y, method = method))
+    boot_estimates <- replicate(
+      R,
+      {
+        boot_index <- sample.int(length(x), replace = TRUE)
+        suppressWarnings(cor(x[boot_index], y[boot_index], method = method))
+      }
+    )
+    alpha <- 1 - conf.level
+    ci <- quantile(
+      boot_estimates,
+      probs = c(alpha / 2, 1 - alpha / 2),
+      na.rm = TRUE,
+      names = FALSE
+    )
+
+    data.frame(
+      method = method,
+      estimate = estimate,
+      conf.low = ci[1],
+      conf.high = ci[2],
+      ci_method = paste(type, boot_type, sep = "_")
+    )
+  }
+}
+```
+
+
+# Data Preparation
+
+```{r load-data}
+# Load data
+questionnaires <- read.csv("data_baseline_questionnaires.csv")
+endpoints <- read.csv("endpoints.csv")
+tail(questionnaires$csid)
+q_01 <- questionnaires[,c(1,2,3,4,10,11,15,16,18,19,21,22,23,24,28,29,34,
+                          39,40,44,59,74,78,
+                          81,82,83,      ###Passive smoking
+                          128,129,137,220:223,
+                          121,188,189,190,191,
+                          205,209,213,218,  ###family  cancer
+                          229,231:235,277,282,283)]
+e_01 <- endpoints[,c(1,66:73)]
+total1 <- left_join(q_01,e_01,by="csid")
+
+# Exclude the participants with missing data in occupation
+total1 <- total1 %>%
+  subset(occupation != 9) %>%
+  subset(!is.na(bmi_calc)) # exclude missing data in BMI
+
+total2 <- total1 %>%
+  mutate(age_at_study=age_at_study_date_x100/100,.keep=c("unused"),.after=age_at_study_date_x100) %>%
+  rename(BMI="bmi_calc")%>%
+  mutate(BMI.cat=ifelse(BMI<18.5, "underweight", ifelse(BMI<24, "normal", ifelse(BMI<28, "overweight", ifelse(BMI>=28, "obesity", NA)))),.after = BMI)%>%
+  mutate(fam.ca=ifelse(mother_cancer %in% c(1)|father_cancer %in% c(1)|children_cancer %in% c(1),1,0),.after=children_cancer)%>%
+  mutate(alcohol.cat=ifelse(alcohol_category %in% c(1,2),0,ifelse(alcohol_category %in% c(3,4),1,2)),.after = "alcohol_category") %>%
+  #0 Never or previous 1 Occasion 2 Current
+  mutate(smoking_category=ifelse(smoking_category %in% c(1),0,ifelse(smoking_category %in% c(3),1,2))) %>%
+  #0 Never 1 previous 2 current
+  mutate(marital_status =ifelse(marital_status %in% c(0),0,1)) %>%
+  #0 Married
+  mutate(education=ifelse(highest_education %in% c(0,1),0,ifelse(highest_education %in% c(2,3),1,2))) %>%
+  mutate(occupation = ifelse(occupation %in% c(8),0,
+                             ifelse(occupation %in% c(2,3,4,7),2,1))) %>%
+  mutate(tc.case=ifelse(ep_range_C73_to__oinc_ep==1,1,0),
+         tc.date=as.Date(ep_range_C73_to__oinc_datedeveloped),
+         tc.death=as.Date(ep_range_C73_to__odu_datedeveloped),
+         censor.date=as.Date(open_access_censoring_date),
+         develop.date=pmin(as.Date(ep_range_C73_to__oinc_datedeveloped),as.Date(ep_range_C73_to__odu_datedeveloped)),
+         fin.date=pmin(tc.date,censor.date,develop.date),
+         fu.pre=time_length(difftime(tc.date,study_date),"years"),
+         fu=time_length(difftime(fin.date,study_date), "years"),
+         fu.death=time_length(difftime(tc.death,study_date),"years")) %>%
+  mutate(household_income=ifelse(household_income %in% c(0,1,2),0,
+                                 ifelse(household_income %in% c(3),1,2)))
+
+total3 <- total2[,c("csid","age_at_study","is_female","education",
+                  "occupation","marital_status","household_income","has_health_cover",
+                  "smoking_category", "cancer_diag", "fam.ca", "BMI.cat", "BMI",
+                  "tc.case", "fu", "region_code", "region_is_urban")]      
+total3 <- total3 %>%
+  mutate(age.ca=ifelse(age_at_study >=30 & age_at_study <40,1,
+                       ifelse(age_at_study >=40& age_at_study <50,2,
+                              ifelse(age_at_study >=50 & age_at_study <60,3,
+                                     ifelse(age_at_study >=60 & age_at_study <70 ,4,5)))))
+total3 <- total3 %>%
+  mutate(education = education + 1,
+         occupation = occupation + 1,
+         household_income = household_income + 1) %>%
+  mutate(sep_score = education + occupation + household_income) %>%
+  mutate(sep_score_cat = ifelse(sep_score <= 5, 1,
+                                 ifelse(sep_score == 6, 2, 3)))
+
+# 20260119 Add alcohol comsumption and exercise
+total3 <- left_join(
+  total3,
+  questionnaires[,c("csid", "alcohol_category", "met")],
+  by="csid"
+)
+table(total3$alcohol_category)
+
+total3 <- total3 %>%
+  mutate(
+    alcohol.cat = ifelse(alcohol_category %in% c(1), 0,
+                         ifelse(alcohol_category %in% c(2), 1, 2))
+  ) %>%
+  group_by(is_female) %>%
+  mutate(
+    met.cat = ifelse(met < quantile(met, 0.75), 0, 1)
+  ) %>%
+  ungroup()
+table(total3$met.cat)
+
+table(total3$cancer_diag) # 2538 cases
+
+# Exclude those with cancer diagnosis at baseline
+total3 <- total3 %>%
+  subset(cancer_diag == 0)
+```
+
+
+# SEP Construction and LCA
+
+```{r lca-analysis}
+# LCA analysis
+# Define the number of classes
+set.seed(2025)
+f2 <- cbind(education,occupation,household_income)~1
+sep_1 <- poLCA(f2, total3, nclass = 2) # AIC 2366694  -
+sep_2 <- poLCA(f2, total3, nclass = 3) # AIC 2347835 0.7%
+sep_3 <- poLCA(f2, total3, nclass = 4) # AIC 2346718 0.05%
+sep_4 <- poLCA(f2, total3, nclass = 5) # AIC 2346477 0.01%
+
+table(sep_2$predclass,total3$sep_score_cat)
+
+lcmodel <- reshape2::melt(sep_2$probs, level=3)
+lcmodel <- lcmodel %>%
+  mutate(Var1 = case_when(grepl("1",Var1) ~ "Medium SEP",
+                          grepl("2",Var1) ~ "High SEP",
+                          grepl("3",Var1) ~ "Low SEP")) %>%
+  mutate(Var2 = case_when(grepl("1",Var2) ~ "Low",
+                          grepl("2",Var2) ~ "Medium",
+                          grepl("3",Var2) ~ "High"))
+
+zp1 <- ggplot(lcmodel,aes(x = L3, y = value, fill = factor(Var2, levels = c("Low", "Medium", "High")))) +
+  geom_bar(stat = 'identity', position = 'stack', width = 0.5) +
+  facet_grid(factor(Var1, levels = c("Low SEP", "Medium SEP", "High SEP"))~.) +
+  scale_fill_brewer(type = 'seq', palette = 'Greens') +
+  theme_bw() +
+  labs(x = '', fill = 'probabilities') +
+  guides(fill = guide_legend(reverse = TRUE)) 
+zp2 <- zp1 +
+  theme(
+    # Axis text (tick labels)
+    axis.text.x = element_text(size = 16),
+    axis.text.y = element_text(size = 16),
+    
+    # Axis titles
+    axis.title.x = element_text(size = 16, face = "bold", margin = margin(t = 10)),
+    axis.title.y = element_text(size = 16, face = "bold", margin = margin(r = 10)),
+    
+    # Facet labels
+    strip.text = element_text(size = 16, face = "bold"),
+    
+    # Legend text
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14)
+  )
+
+ggsave(zp2, filename = "lca_sep_classification.png", width = 10, height = 10, dpi = 300)
+
+sep_lca_predclass <- sep_2$predclass
+total3$sep_lca_cat <- dplyr::case_when(
+  sep_lca_predclass == 1 ~ 2,
+  sep_lca_predclass == 2 ~ 3,
+  sep_lca_predclass == 3 ~ 1,
+  TRUE ~ NA_real_
+)
+
+table(total3$sep_lca_cat, total3$sep_score_cat)
+
+# set factor cov
+factor_cov <- c("age.ca", "is_female", "region_is_urban",
+                "BMI.cat", "fam.ca", "smoking_category",
+                "alcohol.cat", "met.cat",
+                "education", "occupation", "household_income",
+                "sep_score_cat", "sep_lca_cat")
+
+# Change to factor
+total3 <- total3 %>%
+  mutate(across(all_of(factor_cov), as.factor))
+```
+
+
+# Baseline Characteristics
+
+```{r baseline-characteristics}
+# Baseline characteristics ####
+baseline <- total3
+baseline$is_female <- 
+  factor(baseline$is_female, levels=c(1,0),
+         labels=c("Female",
+                  "Male"))
+baseline$region_is_urban <- 
+  factor(baseline$region_is_urban, levels=c(1,0),
+         labels=c("Urban",
+                  "Rural"))
+baseline$education <-
+  factor(baseline$education, levels=c(1,2,3),
+         labels=c("Primary school or less",
+                  "Secondary school",
+                  "College/University or above"))
+baseline$occupation <-
+  factor(baseline$occupation, levels=c(1,2,3),
+         labels=c("Low prestige score",
+                  "Medium prestige score",
+                  "High prestige score"))
+baseline$household_income <-
+  factor(baseline$household_income, levels=c(1,2,3),
+         labels=c("< 10,000 RMB/year",
+                  "10,000-19,999 RMB/year",
+                  ">= 20,000 RMB/year"))
+baseline$marital_status <-
+  factor(baseline$marital_status, levels=c(0,1),
+         labels=c("Married",
+                  "Unmarried"))
+baseline$smoking_category <-
+  factor(baseline$smoking_category, levels=c(0,1,2),
+         labels=c("Never",
+                  "Previous",
+                  "Current"))
+baseline$BMI.cat <- ifelse(baseline$BMI.cat == "underweight", 1,
+                          ifelse(baseline$BMI.cat == "normal", 2,
+                                 ifelse(baseline$BMI.cat == "overweight", 3, 4)))
+baseline$BMI.cat <-
+  factor(baseline$BMI.cat, levels=c(1,2,3,4),
+         labels=c("Underweight",
+                  "Normal",
+                  "Overweight",
+                  "Obesity"))
+baseline$fam.ca <- 
+  factor(baseline$fam.ca, levels=c(0,1),
+         labels=c("No",
+                  "Yes"))
+baseline$sep_score_cat <-
+  factor(baseline$sep_score_cat, levels=c(1,2,3),
+         labels=c("Low SEP",
+                  "Medium SEP",
+                  "High SEP"))
+baseline$sep_lca_cat <-
+  factor(baseline$sep_lca_cat, levels=c(1,2,3),
+         labels=c("Low SEP",
+                  "Medium SEP",
+                  "High SEP"))
+baseline$alcohol_category <-
+  factor(baseline$alcohol.cat, levels=c(0,1,2),
+         labels=c("Never",
+                  "Previous",
+                  "Current"))
+baseline$met.cat <-
+  factor(baseline$met.cat, levels=c(0,1),
+         labels=c("Low",
+                  "High"))
+label(baseline$age_at_study) <- "Age (years)"
+label(baseline$is_female) <- "Sex"
+label(baseline$region_is_urban) <- "Region"
+label(baseline$education) <- "Education"
+label(baseline$occupation) <- "Occupation"
+label(baseline$household_income) <- "Household income"
+label(baseline$marital_status) <- "Marital status"
+label(baseline$smoking_category) <- "Smoking status"
+label(baseline$BMI.cat) <- "BMI category"
+label(baseline$fam.ca) <- "Cancer family history"
+label(baseline$alcohol.cat) <- "Alcohol consumption"
+label(baseline$met.cat) <- "Physical activity"
+
+pvalue <- function(x, ...) {
+    # Construct vectors of data y, and groups (strata) g
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+    if (is.numeric(y)) {
+        # For numeric variables, perform a standard 2-sample t-test
+        q <- summary(aov(y ~ g))
+        p <- q[[1]][["Pr(>F)"]][1] 
+    } else {
+        # For categorical variables, perform a chi-squared test of independence
+        p <- chisq.test(table(y, g))$p.value
+    }
+    # Format the p-value, using an HTML entity for the less-than sign.
+    # The initial empty string places the output on the line below the variable label.
+    c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+score_labels <- list(
+  variables = list(
+    age_at_study = "Age (years)",
+    is_female = "Sex",
+    region_is_urban = "Region",
+    education = "Education",
+    occupation = "Occupation",
+    household_income = "Household income",
+    marital_status = "Marital status",
+    smoking_category = "Smoking status",
+    BMI.cat = "BMI category",
+    fam.ca = "Cancer family history",
+    cancer_diag = "Cancer diagnosis history"),
+  groups = list(
+    "", "SEP (score)", ""))
+score_strata <- c(list(Total=baseline),split(baseline, baseline$sep_score_cat))
+baseline_score <- table1(score_strata, score_labels, groupspan = c(1, 3, 1), extra.col=list(`P-value`=pvalue),
+        overall = c(left="Overall"), render.continuous=c(.="Mean, SD"))
+
+
+lca_labels <- list(
+  variables = list(
+    age_at_study = "Age (years)",
+    is_female = "Sex",
+    region_is_urban = "Region",
+    education = "Education",
+    occupation = "Occupation",
+    household_income = "Household income",
+    marital_status = "Marital status",
+    smoking_category = "Smoking status",
+    BMI.cat = "BMI category",
+    fam.ca = "Cancer family history",
+    cancer_diag = "Cancer diagnosis history"),
+  groups = list(
+    "", "SEP (LCA)", ""))
+lca_strata <- c(list(Total=baseline),split(baseline, baseline$sep_lca_cat))
+baseline_lca <- table1(lca_strata, lca_labels, groupspan = c(1, 3, 1), extra.col=list(`P-value`=pvalue),
+        overall = c(left="Overall"), render.continuous=c(.="Mean, SD"))
+baseline_lca <- as.data.frame(baseline_lca)
+baseline_score <- as.data.frame(baseline_score)
+write.csv(baseline_lca, "baseline_lca_table_1.csv", row.names = FALSE)
+write.csv(baseline_score, "baseline_score_table_1.csv", row.names = FALSE)
+
+kappa2(total3[,c("sep_score_cat","sep_lca_cat")], "unweighted") # 0.36 p < 0.001
+
+```
+
+
+# Main Cox Models
+
+```{r main-cox-models}
+# SEP assessed by assigning points ####
+# Crude_model
+sep_score_cruel <- coxph(Surv(fu, tc.case) ~ sep_score_cat, data = total3)
+
+# Model 1
+sep_score_m1 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female, data = total3)
+
+# Model 2
+sep_score_m2 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status, data = total3)
+cox.zph(sep_score_m2)
+
+# Model 3  (use to sensitivity analysis)
+sep_score_m3 <- coxme(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female +  smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status +
+                      (1 | region_code), data = total3)
+
+# Model 4 [overlooked]  (use to sensitivity analysis)
+sep_score_m4 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + age_at_study +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status +
+                      tt(age_at_study), data = total3,
+                      tt = function(x, t, ...) x*t)
+                      
+# Model 5  (use to sensitivity analysis)
+sep_score_m5 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + ns(age_at_study, df = 4) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+
+# Model 6 added alcohol consumption
+sep_score_m6 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+cox.zph(sep_score_m6)
+
+
+rf_score <- random.effects(sep_score_m3)
+VarCorr(sep_score_m3)[[1]]
+
+# SEP assessed by LCA ####
+
+# Crude_model
+sep_lca_cruel <- coxph(Surv(fu, tc.case) ~ sep_lca_cat, data = total3)
+
+# Model 1
+sep_lca_m1 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female, data = total3)
+
+# Model 2
+sep_lca_m2 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status, data = total3)
+cox.zph(sep_lca_m2)
+
+# Model 3 (use to sensitivity analysis)
+sep_lca_m3 <- coxme(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status +
+                      (1 | region_code), data = total3)
+rf_lca <- ranef(sep_lca_m3)
+VarCorr(sep_lca_m3)
+
+sep_lca_m5 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + ns(age_at_study, df = 4) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+summary(sep_lca_m5)
+
+# Model 6 added alcohol consumption
+sep_lca_m6 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+
+# Assessed each variable in SEP ####
+
+#education
+edu_cruel <- coxph(Surv(fu, tc.case) ~ education, data = total3)
+
+# Model 1
+edu_m1 <- coxph(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female, data = total3)
+
+# Model 2
+edu_m2 <- coxph(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status, data = total3)
+
+
+# Model 3 (use to sensitivity analysis)
+edu_m3 <- coxme(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status +
+                      (1 | region_code), data = total3)
+rf_edu <- ranef(edu_m3)
+VarCorr(edu_m3)
+
+edu_m5 <- coxph(Surv(fu, tc.case) ~ education + ns(age_at_study, df = 4) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+summary(edu_m5)
+
+# Model 6 added alcohol consumption
+edu_m6 <- coxph(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+
+# occupation
+# Crude model
+occ_cruel <- coxph(Surv(fu, tc.case) ~ occupation, data = total3)
+
+# Model 1
+occ_m1 <- coxph(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                is_female, data = total3)
+
+# Model 2
+occ_m2 <- coxph(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status, data = total3)
+
+# Model 3
+occ_m3 <- coxme(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status +
+                      (1 | region_code), data = total3)
+rf_occ <- ranef(occ_m3)
+
+occ_m5 <- coxph(Surv(fu, tc.case) ~ occupation + ns(age_at_study, df = 4) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+summary(occ_m5)
+
+# Model 6 added alcohol consumption
+occ_m6 <- coxph(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+
+# household income
+# Crude model
+inc_cruel <- coxph(Surv(fu, tc.case) ~ household_income, data = total3)
+
+# Model 1
+inc_m1 <- coxph(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                is_female, data = total3)
+
+# Model 2
+inc_m2 <- coxph(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status, data = total3)
+
+# Model 3 (use to sensitivity analysis)
+inc_m3 <- coxme(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status +
+                      (1 | region_code), data = total3)
+rf_inc <- ranef(inc_m3)
+VarCorr(inc_m3)
+
+inc_m5 <- coxph(Surv(fu, tc.case) ~ household_income + ns(age_at_study, df = 4) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+summary(inc_m5)
+
+# Model 6 added alcohol consumption
+inc_m6 <- coxph(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3)
+
+rf <- list(score=rf_score,
+           lca=rf_lca,
+           edu=rf_edu,
+           occ=rf_occ,
+           inc=rf_inc)
+
+extract_rf <- function(x, col_name) {
+  # x may be a list (e.g., $region_code) or a named vector/matrix
+  if (is.list(x)) {
+    v <- if ("region_code" %in% names(x)) x[["region_code"]] else x[[1]]
+  } else {
+    v <- x
+  }
+  if (is.matrix(v) || is.data.frame(v)) v <- v[, 1]
+  out <- data.frame(region_code = names(v), tmp = as.numeric(v), row.names = NULL, check.names = FALSE)
+  names(out)[2] <- col_name
+  out
+}
+
+rf_df_list <- purrr::imap(rf, extract_rf)
+rf_combined <- purrr::reduce(rf_df_list, dplyr::full_join, by = "region_code") %>%
+  dplyr::arrange(suppressWarnings(as.numeric(region_code))) %>%
+  dplyr::mutate(dplyr::across(-region_code, ~ round(., 2)))
+print(rf_combined)
+
+write.csv(rf_combined, "random_effects_by_region.csv", row.names = FALSE)
+
+# Modified function to handle coxme objects differently
+extract_formatted_hr_ci <- function(model, model_name) {
+  # Different handling based on model class
+  if (inherits(model, "coxme")) {
+    # Manual extraction for coxme models
+    coef_vals <- coef(model)
+    var_vals <- diag(vcov(model))
+    
+    # Create a dataframe with necessary information
+    model_results <- data.frame(
+      term = names(coef_vals),
+      estimate = exp(coef_vals),
+      conf.low = exp(coef_vals - 1.96 * sqrt(var_vals)),
+      conf.high = exp(coef_vals + 1.96 * sqrt(var_vals)),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    # For regular coxph models
+    model_results <- broom::tidy(model, conf.int = TRUE, exponentiate = TRUE)
+  }
+  
+  # Filter for sep_score_cat terms and format results
+  model_results <- model_results %>%
+    dplyr::filter(grepl("sep_|educa|occu|inco", term)) %>%
+    dplyr::mutate(
+      level = gsub("sep_", "", term) %>% trimws(),
+      formatted = sprintf("HR: %.2f (%.2f-%.2f)", estimate, conf.low, conf.high),
+      model_name = model_name
+    ) %>%
+    dplyr::select(model_name, level, formatted)
+  
+  return(model_results)
+}
+
+combine_cox_results <- function(models_list, extraction_fun) {
+  # Apply the extraction function to all models and combine results
+  score_results <- dplyr::bind_rows(
+    lapply(names(models_list), function(name) {
+      tryCatch({
+        extraction_fun(models_list[[name]], name)
+      }, error = function(e) {
+        message("Error processing model: ", name, " - ", e$message)
+        return(NULL)
+      })
+    })
+  )
+  
+  # Create a wide format dataframe with models as rows and levels as columns
+  score_results <- tidyr::pivot_wider(
+    score_results,
+    id_cols = model_name,
+    names_from = level,
+    values_from = formatted
+  ) %>%
+    dplyr::rename(Model = model_name) %>%
+    dplyr::mutate(low = "Reference")
+  
+  # Reorder columns: Model, low, other levels
+  cols_order <- c("Model", "low")
+  other_cols <- setdiff(names(score_results), cols_order)
+  score_results <- score_results[, c(cols_order, other_cols)]
+  
+  return(score_results)
+}
+
+models_score_list <- list(
+  "Crude model" = sep_score_cruel,
+  "Model 1" = sep_score_m1,
+  "Model 2" = sep_score_m2
+)
+score_results <- combine_cox_results(models_score_list, extract_formatted_hr_ci)
+print(score_results)
+
+models_lca_list <- list(
+  "Crude model" = sep_lca_cruel,
+  "Model 1" = sep_lca_m1,
+  "Model 2" = sep_lca_m2
+)
+lca_results <- combine_cox_results(models_lca_list, extract_formatted_hr_ci)
+print(lca_results)
+
+models_education_list <- list(
+  "Crude model" = edu_cruel,
+  "Model 1" = edu_m1,
+  "Model 2" = edu_m2
+)
+edu_results <- combine_cox_results(models_education_list, extract_formatted_hr_ci)
+print(edu_results)
+
+models_occupation_list <- list(
+  "Crude model" = occ_cruel,
+  "Model 1" = occ_m1,
+  "Model 2" = occ_m2
+)
+occ_results <- combine_cox_results(models_occupation_list, extract_formatted_hr_ci)
+print(occ_results)
+
+models_income_list <- list(
+  "Crude model" = inc_cruel,
+  "Model 1" = inc_m1,
+  "Model 2" = inc_m2
+)
+inc_results <- combine_cox_results(models_income_list, extract_formatted_hr_ci)
+print(inc_results)
+
+# result of model with added alcohol consumption
+models_6_list <- list(
+  "SEP score" = sep_score_m6,
+  "SEP LCA" = sep_lca_m6,
+  "Education" = edu_m6,
+  "Occupation" = occ_m6,
+  "Income" = inc_m6
+)
+m6_results <- combine_cox_results(models_6_list, extract_formatted_hr_ci)
+df_list <- list(score_results, lca_results, edu_results, 
+                inc_results, occ_results)
+
+total_results <- df_list %>%
+  reduce(full_join, by = c("Model", "low"))
+write.csv(total_results, file = "table2.csv", row.names = FALSE, quote = TRUE)
+
+models_5_list <- list(
+  "SEP score" = sep_score_m5,
+  "SEP LCA" = sep_lca_m5,
+  "Education" = edu_m5,
+  "Occupation" = occ_m5,
+  "Income" = inc_m5
+)
+m5_results <- combine_cox_results(models_5_list, extract_formatted_hr_ci)
+
+```
+
+
+# Age-Specific Incidence Rates
+
+```{r age-incidence-plots}
+total3 <- total3 %>%
+  mutate(age_endpoint = age_at_study+round(fu,2)) %>%
+  mutate(age.ca4 = cut(age_endpoint,
+                        breaks = c(0, 40, 50, 60, 70, 80, Inf),
+                        labels = c(NA, 1, 2, 3, 4, NA),
+                        right = FALSE))
+table(total3$age.ca4, total3$tc.case)
+sp <- read.csv("sp_2.csv", fileEncoding = "UTF-8-BOM")
+
+# in sp, create a new row 'total' that sums up all age groups
+sp[11,1] <- "total"
+for (i in 2:ncol(sp)) {
+  sp[11,i] <- sum(sp[1:10,i])
+}
+
+age_incidence <- data.frame(
+  age_group = integer(),
+  person_year = numeric(),
+  disease_cases = integer(),
+  incidence_rate = numeric(),
+  stringsAsFactors = FALSE
+)
+# Calculate person-year and crude incidence rate for each age group
+for (age_group in levels(total3$age.ca4)) {
+  df_age <- total3 %>% filter(age.ca4 == age_group)
+  
+  person_year <- sum(df_age$fu)
+  disease_cases <- sum(df_age$tc.case)
+  incidence_rate <- (disease_cases / person_year) * 100000
+  
+  age_incidence <- rbind(age_incidence, data.frame(
+    age_group = age_group,
+    person_year = person_year,
+    disease_cases = disease_cases,
+    incidence_rate = incidence_rate
+  ))
+}
+
+age_incidence <- age_incidence %>%
+  rowwise() %>%
+  mutate(
+    # Poisson exact CI on rate per PY
+    .pp = list(poisson.test(disease_cases, T = person_year, conf.level = 0.95)$conf.int),
+    rate_per_1e5 = (disease_cases / person_year) * 1e5,
+    ci_low_per_1e5 = .pp[[1]][1] * 1e5,
+    ci_high_per_1e5 = .pp[[2]][1] * 1e5
+  ) %>%
+  ungroup() %>%
+  dplyr::select(age_group, person_year, disease_cases,
+         incidence_rate = rate_per_1e5,
+         ci_low = ci_low_per_1e5, ci_high = ci_high_per_1e5)
+
+age_rate_calculator <- function(data, event, time,
+                            strata = NULL, age_strata = NULL,
+                            unit = 100000, add_ci = FALSE, conf.level = 0.95) {
+  stopifnot(is.data.frame(data))
+  stopifnot(is.character(event), event %in% names(data))
+  stopifnot(is.character(time), time %in% names(data))
+  if (!is.null(strata)) stopifnot(is.character(strata), strata %in% names(data))
+  if (!is.null(age_strata)) stopifnot(is.character(age_strata), age_strata %in% names(data))
+
+  df <- data %>%
+    mutate(`..event` = as.numeric(.data[[event]]),
+           `..time`  = as.numeric(.data[[time]]))
+
+  # No grouping
+  if (is.null(strata) && is.null(age_strata)) {
+    total_py <- sum(df$`..time`, na.rm = TRUE)
+    k <- sum(df$`..event`, na.rm = TRUE)
+    out <- data.frame(
+      count = k,
+      person_years = total_py,
+      rate = ifelse(total_py > 0, k / total_py * unit, NA_real_)
+    )
+    if (add_ci) {
+      ci <- if (total_py > 0) poisson.test(k, T = total_py, conf.level = conf.level)$conf.int else c(NA_real_, NA_real_)
+      out$ci_low <- ci[1] * unit
+      out$ci_high <- ci[2] * unit
+    }
+    return(out)
+  }
+
+  # One grouping
+  if (!is.null(strata) && is.null(age_strata)) {
+    g1 <- rlang::sym(strata)
+    out <- df %>%
+      group_by(!!g1, .drop = FALSE) %>%
+      summarise(
+        person_years = sum(`..time`, na.rm = TRUE),
+        count = sum(`..event`, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        rate = ifelse(person_years > 0, count / person_years * unit, NA_real_)
+      )
+    if (add_ci) {
+      out <- out %>%
+        rowwise() %>%
+        mutate(
+          .ci = list(if (person_years > 0) poisson.test(count, T = person_years, conf.level = conf.level)$conf.int else c(NA_real_, NA_real_)),
+          ci_low = .ci[[1]] * unit,
+          ci_high = .ci[[2]] * unit
+        ) %>%
+        ungroup() %>%
+        dplyr::select(-.ci)
+    }
+    names(out)[1] <- strata
+    return(out)
+  }
+
+  # Two groupings: SEP within age groups (or vice versa)
+  g1 <- rlang::sym(strata)
+  g2 <- rlang::sym(age_strata)
+  out <- df %>%
+    group_by(!!g1, !!g2, .drop = FALSE) %>%
+    summarise(
+      person_years = sum(`..time`, na.rm = TRUE),
+      count = sum(`..event`, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    tidyr::complete(!!g1, !!g2, fill = list(person_years = 0, count = 0)) %>%
+    mutate(
+      rate = ifelse(person_years > 0, count / person_years * unit, NA_real_)
+    )
+
+  if (add_ci) {
+    out <- out %>%
+      rowwise() %>%
+      mutate(
+        .ci = list(if (person_years > 0) poisson.test(count, T = person_years, conf.level = conf.level)$conf.int else c(NA_real_, NA_real_)),
+        ci_low = .ci[[1]] * unit,
+        ci_high = .ci[[2]] * unit
+      ) %>%
+      ungroup() %>%
+      dplyr::select(-.ci)
+  }
+
+  names(out)[1:2] <- c(strata, age_strata)
+  out
+}
+
+age_incidence
+score_incidence_rate <- age_rate_calculator(total3, "tc.case", "fu",
+                                            strata = "sep_score_cat",
+                                            age_strata = "age.ca4",
+                                            add_ci = TRUE)
+lca_incidence_rate <- age_rate_calculator(total3, "tc.case", "fu",
+                                          strata = "sep_lca_cat",
+                                          age_strata = "age.ca4",
+                                          add_ci = TRUE)
+education_incidence_rate <- age_rate_calculator(total3, "tc.case", "fu",
+                                                strata = "education",
+                                                age_strata = "age.ca4",
+                                                add_ci = TRUE)
+occupation_incidence_rate <- age_rate_calculator(total3, "tc.case", "fu",
+                                                 strata = "occupation",
+                                                 age_strata = "age.ca4",
+                                                 add_ci = TRUE)
+income_incidence_rate <- age_rate_calculator(total3, "tc.case", "fu",
+                                             strata = "household_income",
+                                             age_strata = "age.ca4",
+                                             add_ci = TRUE)
+write.csv(age_incidence,
+          "age_incidence.csv",
+          row.names = FALSE)
+write.csv(score_incidence_rate,
+          "score_incidence_rate.csv",
+          row.names = FALSE)
+write.csv(lca_incidence_rate,
+          "lca_incidence_rate.csv",
+          row.names = FALSE)
+write.csv(education_incidence_rate,
+          "education_incidence_rate.csv",
+          row.names = FALSE)
+write.csv(occupation_incidence_rate,
+          "occupation_incidence_rate.csv",
+          row.names = FALSE)
+write.csv(income_incidence_rate,
+          "income_incidence_rate.csv",
+          row.names = FALSE)
+#### Plot incidence rate by age group
+age_incidence <- age_incidence %>%
+  mutate(
+    age_group = as.integer(as.character(age_group)),
+    age_mid = c(45, 55, 65, 75)[age_group]
+  )
+
+age_plot <- ggplot(age_incidence,
+       aes(x = age_mid, y = incidence_rate)) +
+  geom_line(color = "#000000") +
+  geom_point(size = 2.8, color = "#000000") +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 2, color = "#000000") +
+  scale_x_continuous(
+    name = "Age (years)",
+    breaks = c(40, 50, 60, 70, 80),
+    limits = c(40, 80)
+  ) +
+  labs(
+    title = "Total"
+  ) +
+  scale_y_continuous(name = "Incidence rate per 100,000 person-years") +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+
+score_incidence_rate <- score_incidence_rate %>%
+  mutate(
+    age_mid = c(45, 55, 65, 75)[as.integer(as.character(age.ca4))],
+    sep_score_cat = factor(sep_score_cat,
+                           levels = c(3, 2, 1),
+                           labels = c("High", "Medium", "Low"))
+  )
+
+score_incidence_rate <- score_incidence_rate %>%
+  filter(!is.na(age.ca4))
+score_incidence_rate <- score_incidence_rate[-c(1,6,11), ]
+score_poisson_model <- glm(count ~ age.ca4 + sep_score_cat + offset(log(person_years)),
+                     family = quasipoisson(link = "log"),
+                     data = score_incidence_rate)
+check_overdispersion(score_poisson_model) # NO overdispersion
+drop1(score_poisson_model, test = "F")
+
+
+score_plot <- ggplot(score_incidence_rate,
+       aes(x = age_mid, y = rate,
+           group = sep_score_cat,
+           color = sep_score_cat)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 1.8, alpha = 0.9) +
+  scale_color_manual(values = c("#0072B2", "#E69F00", "#56B4E9")) +
+  scale_x_continuous(name = "Age (years)",
+                     breaks = c(40, 50, 60, 70, 80),
+                     limits = c(40, 80)) +
+  scale_y_continuous(name = "Incidence rate per 100,000 person-years") +
+  labs(
+    title = "Score-based SEP",
+    color = "Score-based SEP") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+lca_incidence_rate <- lca_incidence_rate %>%
+  mutate(
+    age_mid = c(45, 55, 65, 75)[as.integer(as.character(age.ca4))],
+    sep_lca_cat = factor(sep_lca_cat,
+                           levels = c(3, 2, 1),
+                           labels = c("High", "Medium", "Low"))
+  )
+lca_incidence_rate <- lca_incidence_rate %>%
+  filter(!is.na(age.ca4))
+lca_incidence_rate <- lca_incidence_rate[-c(1,6,11), ]
+lca_poisson_model <- glm(count ~ age.ca4 + sep_lca_cat + offset(log(person_years)),
+                     family = quasipoisson(link = "log"),
+                     data = lca_incidence_rate)
+check_overdispersion(lca_poisson_model) # NO overdispersion
+drop1(lca_poisson_model, test = "F")
+
+lca_plot <- ggplot(lca_incidence_rate,
+       aes(x = age_mid, y = rate,
+           group = sep_lca_cat,
+           color = sep_lca_cat)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 1.8, alpha = 0.9) +
+  scale_color_manual(values = c("#0072B2", "#E69F00", "#56B4E9")) +
+  scale_x_continuous(name = "Age (years)",
+                     breaks = c(40, 50, 60, 70, 80),
+                     limits = c(40, 80)) +
+  scale_y_continuous(name = "Incidence rate per 100,000 person-years") +
+  labs(
+    title = "LCA-based SEP",
+    color = "LCA-based SEP") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+education_incidence_rate <- education_incidence_rate %>%
+  mutate(
+    age_mid = c(45, 55, 65, 75)[as.integer(as.character(age.ca4))],
+    education = factor(education,
+                           levels = c(3, 2, 1),
+                           labels = c("High", "Medium", "Low"))
+  )
+
+education_incidence_rate <- education_incidence_rate %>%
+  filter(!is.na(age.ca4))
+education_incidence_rate <- education_incidence_rate[-c(1,6,11), ]
+education_poisson_model <- glm(count ~ age.ca4 + education + offset(log(person_years)),
+                     family = quasipoisson(link = "log"),
+                     data = education_incidence_rate)
+check_overdispersion(education_poisson_model) # NO overdispersion
+drop1(education_poisson_model, test = "F")
+
+edu_plot <- ggplot(education_incidence_rate,
+       aes(x = age_mid, y = rate,
+           group = education,
+           color = education)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 1.8, alpha = 0.9) +
+  scale_color_manual(values = c("#0072B2", "#E69F00", "#56B4E9")) +
+  scale_x_continuous(name = "Age (years)",
+                     breaks = c(40, 50, 60, 70, 80),
+                     limits = c(40, 80)) +
+  scale_y_continuous(name = "Incidence rate per 100,000 person-years") +
+  labs(
+    title = "Education attainment",
+    color = "Education attainment") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+income_incidence_rate <- income_incidence_rate %>%
+  mutate(
+    age_mid = c(45, 55, 65, 75)[as.integer(as.character(age.ca4))],
+    household_income = factor(household_income,
+                           levels = c(3, 2, 1),
+                           labels = c("High", "Medium", "Low"))
+  )
+income_incidence_rate <- income_incidence_rate %>%
+  filter(!is.na(age.ca4))
+income_incidence_rate <- income_incidence_rate[-c(1,6,11), ]
+income_poisson_model <- glm(count ~ age.ca4 + household_income + offset(log(person_years)),
+                     family = quasipoisson(link = "log"),
+                     data = income_incidence_rate)
+check_overdispersion(income_poisson_model) # overdispersion
+drop1(income_poisson_model, test = "F")
+  
+inc_plot <- ggplot(income_incidence_rate,
+       aes(x = age_mid, y = rate,
+           group = household_income,
+           color = household_income)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 1.8, alpha = 0.9) +
+  scale_color_manual(values = c("#0072B2", "#E69F00", "#56B4E9")) +
+  scale_x_continuous(name = "Age (years)",
+                     breaks = c(40, 50, 60, 70, 80),
+                     limits = c(40, 80)) +
+  scale_y_continuous(name = "Incidence rate per 100,000 person-years") +
+  labs(
+    title = "Household income",
+    color = "Household income") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+occupation_incidence_rate <- occupation_incidence_rate %>%
+  mutate(
+    age_mid = c(45, 55, 65, 75)[as.integer(as.character(age.ca4))],
+    occupation = factor(occupation,
+                           levels = c(3, 2, 1),
+                           labels = c("High", "Medium", "Low"))
+  )
+occupation_incidence_rate <- occupation_incidence_rate %>%
+  filter(!is.na(age.ca4))
+occupation_incidence_rate <- occupation_incidence_rate[-c(1,6,11), ]
+occupation_poisson_model <- glm(count ~ age.ca4 + occupation + offset(log(person_years)),
+                     family = quasipoisson(link = "log"),
+                     data = occupation_incidence_rate)
+check_overdispersion(occupation_poisson_model)
+drop1(occupation_poisson_model, test = "F")
+
+
+
+occ_plot <- ggplot(occupation_incidence_rate,
+       aes(x = age_mid, y = rate,
+           group = occupation,
+           color = occupation)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 1.8, alpha = 0.9) +
+  scale_color_manual(values = c("#0072B2", "#E69F00", "#56B4E9")) +
+  scale_x_continuous(name = "Age (years)",
+                     breaks = c(40, 50, 60, 70, 80),
+                     limits = c(40, 80)) +
+  scale_y_continuous(name = "Incidence rate per 100,000 person-years",
+                     limits = c(0, 65)) +
+  labs(
+    title = "Occupation prestige score",
+    color = "Occupation prestige score") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+# Combined plot of overall
+
+
+combined_inc_plot <- patchwork::wrap_plots(
+  age_plot, score_plot, lca_plot,
+  edu_plot, inc_plot, occ_plot,
+  ncol = 3
+) +
+  plot_layout(guides = "keep")
+
+print(combined_inc_plot)
+
+ggsave(
+  combined_inc_plot,
+  filename = "incidence_rate_plots.pdf",
+  width = 16,
+  height = 10,
+  dpi = 300
+)
+```
+
+
+# Multiplicative Interaction: Age
+
+```{r interaction-age}
+total3$sep_score_bin <- ifelse(total3$sep_score_cat == 3, 1, 0)
+total3$sep_lca_bin <- ifelse(total3$sep_lca_cat == 3, 1, 0)
+total3$education_bin <- ifelse(total3$education == 3, 1, 0)
+total3$occupation_bin <- ifelse(total3$occupation == 3, 1, 0)
+total3$income_bin <- ifelse(total3$household_income == 3, 1, 0)
+
+
+# Age (50) ####
+total3$age_bin <- cut(total3$age_at_study, breaks = c(-Inf, 50, Inf), labels = c("<50", ">=50"), right = FALSE)
+total3$age_bin <- factor(total3$age_bin, levels = c(">=50", "<50"))
+# score
+age_50less_score <- coxph(Surv(fu, tc.case) ~ sep_score_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == "<50",])
+age_50more_score <- coxph(Surv(fu, tc.case) ~ sep_score_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == ">=50",])
+age_interaction_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_bin:age_bin +
+                sep_score_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+
+age_m3_score <- coxph(Surv(fu, tc.case) ~ 
+                sep_score_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+anova(age_interaction_score, age_m3_score)
+models_age_list <- list(
+  "Age <50" = age_50less_score,
+  "Age >=50" = age_50more_score
+)
+age_score_results <- combine_cox_results(models_age_list, extract_formatted_hr_ci)
+age_score_results[1,4] <- anova(age_interaction_score, age_m3_score)$'Pr(>|Chi|)'[2]
+print(age_score_results)
+
+# lca
+age_50less_lca <- coxph(Surv(fu, tc.case) ~ sep_lca_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == "<50",])
+age_50more_lca <- coxph(Surv(fu, tc.case) ~ sep_lca_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == ">=50",])
+age_interaction_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_bin * age_bin +
+                sep_lca_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+
+age_m3_lca <- coxph(Surv(fu, tc.case) ~ 
+                sep_lca_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+models_age_list <- list(
+  "Age <50" = age_50less_lca,
+  "Age >=50" = age_50more_lca
+)
+age_lca_results <- combine_cox_results(models_age_list, extract_formatted_hr_ci)
+age_lca_results[1,4] <- anova(age_interaction_lca, age_m3_lca)$'Pr(>|Chi|)'[2]
+print(age_lca_results)
+
+# Education
+age_50less_edu <- coxph(Surv(fu, tc.case) ~ education_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == "<50",])
+age_50more_edu <- coxph(Surv(fu, tc.case) ~ education_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == ">=50",])
+age_interaction_edu <- coxph(Surv(fu, tc.case) ~
+                education_bin:age_bin +
+                education_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+
+age_m3_edu <- coxph(Surv(fu, tc.case) ~
+                education_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+models_age_list <- list(
+  "Age <50" = age_50less_edu,
+  "Age >=50" = age_50more_edu
+)
+age_edu_results <- combine_cox_results(models_age_list, extract_formatted_hr_ci)
+age_edu_results[1,4] <- anova(age_interaction_edu, age_m3_edu)$'Pr(>|Chi|)'[2]
+print(age_edu_results)
+
+# household income
+age_50less_inc <- coxph(Surv(fu, tc.case) ~ income_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == "<50",])
+age_50more_inc <- coxph(Surv(fu, tc.case) ~ income_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == ">=50",])
+age_interaction_inc <- coxph(Surv(fu, tc.case) ~
+                income_bin:age_bin +
+                income_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+
+age_m3_inc <- coxph(Surv(fu, tc.case) ~
+                income_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+models_age_list <- list(
+  "Age <50" = age_50less_inc,
+  "Age >=50" = age_50more_inc
+)
+age_inc_results <- combine_cox_results(models_age_list, extract_formatted_hr_ci)
+age_inc_results[1,4] <- anova(age_interaction_inc, age_m3_inc)$'Pr(>|Chi|)'[2]
+print(age_inc_results)
+
+# occupation prestige
+age_50less_occ <- coxph(Surv(fu, tc.case) ~ occupation_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == "<50",])
+age_50more_occ <- coxph(Surv(fu, tc.case) ~ occupation_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$age_bin == ">=50",])
+age_interaction_occ <- coxph(Surv(fu, tc.case) ~
+                occupation_bin:age_bin +
+                occupation_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+
+age_m3_occ <- coxph(Surv(fu, tc.case) ~
+                occupation_bin + age_bin +
+                is_female + region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+models_age_list <- list(
+  "Age <50" = age_50less_occ,
+  "Age >=50" = age_50more_occ
+)
+age_occ_results <- combine_cox_results(models_age_list, extract_formatted_hr_ci)
+age_occ_results[1,4] <- anova(age_interaction_occ, age_m3_occ)$'Pr(>|Chi|)'[2]
+print(age_occ_results)
+
+df_list <- list(age_score_results, age_lca_results, age_edu_results, 
+                age_inc_results, age_occ_results)
+
+age_subgroup_results <- df_list %>%
+  reduce(full_join, by = c("Model", "low"))
+
+
+write.csv(age_subgroup_results, "age_subgroup_results.csv", row.names = FALSE)
+```
+
+
+# Multiplicative Interaction: Sex
+
+```{r interaction-sex}
+#### Calculate subgroup anaysis by sex with 3 categories of SEP
+
+#& Score-based SEP
+female_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$is_female == 1,])
+male_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3[total3$is_female == 0,])
+sex_interaction_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat:is_female +
+                sep_score_cat + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+sex_m3_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status,
+                data = total3)
+
+model_sex_list <- list(
+  "Female" = female_score,
+  "Male" = male_score
+)
+sex_score_results <- combine_cox_results(model_sex_list, extract_formatted_hr_ci)
+sex_score_results[1, 5] <- anova(sex_interaction_score, sex_m3_score)$'Pr(>|Chi|)'[2]
+print(sex_score_results)
+
+#& LCA-based SEP
+female_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 1,])
+male_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 0,])
+sex_interaction_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat:is_female +
+                sep_lca_cat + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+
+sex_m3_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+
+model_sex_list <- list(
+  "Female" = female_lca,
+  "Male" = male_lca
+)
+sex_lca_results <- combine_cox_results(model_sex_list, extract_formatted_hr_ci)
+sex_lca_results[1, 5] <- anova(sex_interaction_lca, sex_m3_lca)$'Pr(>|Chi|)'[2]
+print(sex_lca_results)
+
+#& Education
+female_edu <- coxph(Surv(fu, tc.case) ~
+                education +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 1,])
+male_edu <- coxph(Surv(fu, tc.case) ~
+                education +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 0,])
+sex_interaction_edu <- coxph(Surv(fu, tc.case) ~
+                education:is_female +
+                education + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+
+sex_m3_edu <- coxph(Surv(fu, tc.case) ~
+                education + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+
+model_sex_list <- list(
+  "Female" = female_edu,
+  "Male" = male_edu
+)
+sex_edu_results <- combine_cox_results(model_sex_list, extract_formatted_hr_ci)
+sex_edu_results[1, 5] <- anova(sex_interaction_edu, sex_m3_edu)$'Pr(>|Chi|)'[2]
+print(sex_edu_results)
+
+#& household income
+female_inc <- coxph(Surv(fu, tc.case) ~
+                household_income +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 1,])
+male_inc <- coxph(Surv(fu, tc.case) ~
+                household_income +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 0,])
+sex_interaction_inc <- coxph(Surv(fu, tc.case) ~
+                household_income:is_female +
+                household_income + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+
+sex_m3_inc <- coxph(Surv(fu, tc.case) ~
+                household_income + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+
+model_sex_list <- list(
+  "Female" = female_inc,
+  "Male" = male_inc
+)
+sex_inc_results <- combine_cox_results(model_sex_list, extract_formatted_hr_ci)
+sex_inc_results[1, 5] <- anova(sex_interaction_inc, sex_m3_inc)$'Pr(>|Chi|)'[2]
+print(sex_inc_results)
+
+# occupation
+female_occ <- coxph(Surv(fu, tc.case) ~
+                occupation +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 1,])
+male_occ <- coxph(Surv(fu, tc.case) ~
+                occupation +
+                strata(age.ca) +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3[total3$is_female == 0,])
+sex_interaction_occ <- coxph(Surv(fu, tc.case) ~
+                occupation:is_female +
+                occupation + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+sex_m3_occ <- coxph(Surv(fu, tc.case) ~
+                occupation + strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                BMI.cat + fam.ca + marital_status + alcohol.cat,
+                data = total3)
+model_sex_list <- list(
+  "Female" = female_occ,
+  "Male" = male_occ
+)
+sex_occ_results <- combine_cox_results(model_sex_list, extract_formatted_hr_ci)
+sex_occ_results[1, 5] <- anova(sex_interaction_occ, sex_m3_occ)$'Pr(>|Chi|)'[2]
+print(sex_occ_results)
+
+
+sex_subgroup_list <- list(
+  "Score-based SEP" = sex_score_results,
+  "LCA-based SEP" = sex_lca_results,
+  "Education" = sex_edu_results,
+  "Household income" = sex_inc_results,
+  "Occupation prestige score" = sex_occ_results
+)
+
+sex_subgroup_results <- sex_subgroup_list %>%
+  map(~ set_names(.x, names(sex_subgroup_list[[1]]))) %>%
+  imap_dfr(~ mutate(.x, Variables = .y, .before = 1))
+
+colnames(sex_subgroup_results) <- c(
+  "Variables",
+  "Model",
+  "Low",
+  "medium HR (95% CI)",
+  "high HR (95% CI)",
+  "P-value"
+)
+
+write.csv(sex_subgroup_results, "sex_subgroup_results.csv", row.names = FALSE)
+```
+
+
+# Multiplicative Interaction: BMI
+
+```{r interaction-bmi}
+# BMI ####
+total3 <- total3 %>%
+  mutate(BMI_2 = cut(BMI, breaks = c(-Inf, 24, Inf),
+                     labels = c("Normal", "Unnormal"), right = FALSE))
+total3$BMI_2 <- factor(total3$BMI_2, levels = c("Normal", "Unnormal"))
+
+# For overweight and obesity subgroup analysis ####
+## Score-based SEP ####
+table(total3$BMI_2, total3$tc.case)
+table(total3$BMI.cat)
+# total3$obese <- ifelse(total3$BMI.cat == "Unnormal", 1, 0)
+bmi_low_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Normal",])
+bmi_high_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Unnormal",])
+bmi_interaction_score <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat * BMI_2 +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3)
+bmi_score_null <- coxph(Surv(fu, tc.case) ~
+                sep_score_cat + strata(age.ca) + is_female +
+                region_is_urban + smoking_category + BMI_2 +
+                fam.ca + marital_status,
+                data = total3)
+BMI_score_results <- combine_cox_results(
+  list(
+    "Normal weight" = bmi_low_score,
+    "Overweight/Obesity" = bmi_high_score
+  ),
+  extract_formatted_hr_ci
+)
+BMI_score_results[1, 5] <- anova(bmi_interaction_score, bmi_score_null)$'Pr(>|Chi|)'[2]
+print(BMI_score_results)
+
+## LCA-based SEP ####
+bmi_low_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Normal",])
+bmi_high_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Unnormal",])
+bmi_interaction_lca <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat * BMI_2 +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3)
+bmi_lca_null <- coxph(Surv(fu, tc.case) ~
+                sep_lca_cat + strata(age.ca) + is_female +
+                region_is_urban + smoking_category + BMI_2 +
+                fam.ca + marital_status,
+                data = total3)
+BMI_lca_results <- combine_cox_results(
+  list(
+    "Normal weight" = bmi_low_lca,
+    "Overweight/Obesity" = bmi_high_lca
+  ),
+  extract_formatted_hr_ci
+)
+BMI_lca_results[1, 5] <- anova(bmi_interaction_lca, bmi_lca_null)$'Pr(>|Chi|)'[2]
+print(BMI_lca_results)
+
+## Education####
+bmi_low_edu <- coxph(Surv(fu, tc.case) ~
+                education +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Normal",])
+bmi_high_edu <- coxph(Surv(fu, tc.case) ~
+                education +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Unnormal",])
+bmi_interaction_edu <- coxph(Surv(fu, tc.case) ~
+                education * BMI_2 +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3)
+bmi_edu_null <- coxph(Surv(fu, tc.case) ~
+                education + strata(age.ca) + is_female +
+                region_is_urban + smoking_category + BMI_2 +
+                fam.ca + marital_status,
+                data = total3)
+BMI_edu_results <- combine_cox_results(
+  list(
+    "Normal weight" = bmi_low_edu,
+    "Overweight/Obesity" = bmi_high_edu
+  ),
+  extract_formatted_hr_ci
+)
+BMI_edu_results[1, 5] <- anova(bmi_interaction_edu, bmi_edu_null)$'Pr(>|Chi|)'[2]
+print(BMI_edu_results)
+
+## Income####
+bmi_low_inc <- coxph(Surv(fu, tc.case) ~
+                household_income +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Normal",])
+bmi_high_inc <- coxph(Surv(fu, tc.case) ~
+                household_income +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Unnormal",])
+bmi_interaction_inc <- coxph(Surv(fu, tc.case) ~
+                household_income * BMI_2 +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3)
+bmi_inc_null <- coxph(Surv(fu, tc.case) ~
+                household_income + strata(age.ca) + is_female +
+                region_is_urban + smoking_category + BMI_2 +
+                fam.ca + marital_status,
+                data = total3)
+BMI_inc_results <- combine_cox_results(
+  list(
+    "Normal weight" = bmi_low_inc,
+    "Overweight/Obesity" = bmi_high_inc
+  ),
+  extract_formatted_hr_ci
+)
+BMI_inc_results[1, 5] <- anova(bmi_interaction_inc, bmi_inc_null)$'Pr(>|Chi|)'[2]
+print(BMI_inc_results)
+
+## Occupation####
+bmi_low_occ <- coxph(Surv(fu, tc.case) ~
+                occupation +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Normal",])
+bmi_high_occ <- coxph(Surv(fu, tc.case) ~
+                occupation +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3[total3$BMI_2 == "Unnormal",])
+bmi_interaction_occ <- coxph(Surv(fu, tc.case) ~
+                occupation * BMI_2 +
+                strata(age.ca) + is_female +
+                region_is_urban + smoking_category +
+                fam.ca + marital_status,
+                data = total3)
+bmi_occ_null <- coxph(Surv(fu, tc.case) ~
+                occupation + strata(age.ca) + is_female +
+                region_is_urban + smoking_category + BMI_2 +
+                fam.ca + marital_status,
+                data = total3)
+BMI_occ_results <- combine_cox_results(
+  list(
+    "Normal weight" = bmi_low_occ,
+    "Overweight/Obesity" = bmi_high_occ
+  ),
+  extract_formatted_hr_ci
+)
+BMI_occ_results[1, 5] <- anova(bmi_interaction_occ, bmi_occ_null)$'Pr(>|Chi|)'[2]
+print(BMI_occ_results)
+
+BMI_subgroup_list <- list(
+  "Score-based SEP" = BMI_score_results,
+  "LCA-based SEP" = BMI_lca_results,
+  "Education" = BMI_edu_results,
+  "Household income" = BMI_inc_results,
+  "Occupation prestige score" = BMI_occ_results
+)
+
+BMI_subgroup <- BMI_subgroup_list %>%
+  map(~ set_names(.x, names(BMI_subgroup_list[[1]]))) %>%
+  imap_dfr(~ mutate(.x, Variables = .y, .before = 1))
+
+colnames(BMI_subgroup) <- c(
+  "Variables",
+  "Model",
+  "Low",
+  "medium HR (95% CI)",
+  "high HR (95% CI)",
+  "P-value"
+)
+
+write.csv(BMI_subgroup, "BMI_subgroup20260119.csv", row.names = FALSE)
+```
+
+
+# Subgroup Forest Plots
+
+```{r subgroup-forest-plots}
+extract_hr_values <- function(hr_string) {
+  hr_string <- as.character(hr_string)
+  if (length(hr_string) == 0 || is.na(hr_string) || !str_detect(hr_string, "\\d+\\.\\d+")) {
+    return(c(NA_real_, NA_real_, NA_real_))
+  }
+
+  estimate <- as.numeric(str_extract(hr_string, "\\d+\\.\\d+"))
+  lower_ci <- as.numeric(str_extract(hr_string, "(?<=\\()\\d+\\.\\d+"))
+  upper_ci <- as.numeric(str_extract(hr_string, "(?<=-)\\d+\\.\\d+"))
+  c(estimate, lower_ci, upper_ci)
+}
+
+prepare_subgroup_forest_data <- function(data) {
+  medium_values <- t(vapply(data$`medium HR (95% CI)`, extract_hr_values, numeric(3)))
+  high_values <- t(vapply(data$`high HR (95% CI)`, extract_hr_values, numeric(3)))
+
+  data %>%
+    mutate(
+      medium_estimate = medium_values[, 1],
+      medium_lower_ci = medium_values[, 2],
+      medium_upper_ci = medium_values[, 3],
+      high_estimate = high_values[, 1],
+      high_lower_ci = high_values[, 2],
+      high_upper_ci = high_values[, 3],
+      ` ` = paste(rep(" ", 20), collapse = " "),
+      `  ` = paste(rep(" ", 20), collapse = " "),
+      `P-value` = ifelse(is.na(`P-value`), "", as.character(round(as.numeric(`P-value`), 3)))
+    )
+}
+
+plot_subgroup_forest <- function(forest_data, filename) {
+  tm <- forest_theme(
+    base_size = 10,
+    refline_col = "black",
+    footnote_gp = gpar(col = "blue"),
+    ci_col = c("#f55858ff"),
+    core = list(bg_params = list(fill = c("#ffffffff")))
+  )
+
+  subgroup_forest <- forest(
+    forest_data[, c(
+      "Variables", "Model", "Low", "medium HR (95% CI)",
+      " ", "high HR (95% CI)", "  ", "P-value"
+    )],
+    est = list(forest_data$medium_estimate, forest_data$high_estimate),
+    lower = list(forest_data$medium_lower_ci, forest_data$high_lower_ci),
+    upper = list(forest_data$medium_upper_ci, forest_data$high_upper_ci),
+    ci_column = c(5, 7),
+    ref_line = 1,
+    xlim = c(0, 6),
+    ticks_at = c(0, 1, 2, 4, 6),
+    xlab = "Hazard Ratio (95% CI)",
+    theme = tm
+  )
+
+  subgroup_forest <- add_border(subgroup_forest, part = "header")
+  ggsave(subgroup_forest, filename = filename, width = 10, height = 8, dpi = 300)
+  subgroup_forest
+}
+
+prepare_age_forest_data <- function(data) {
+  hr_cols <- c(
+    "score_bin",
+    "lca_bin",
+    "education_bin",
+    "income_bin",
+    "occupation_bin"
+  )
+  p_cols <- names(data)[c(4, 6, 8, 10, 12)]
+
+  hr_values <- lapply(
+    hr_cols,
+    function(col_name) t(vapply(data[[col_name]], extract_hr_values, numeric(3)))
+  )
+  names(hr_values) <- hr_cols
+
+  display_data <- data.frame(
+    Model = data$Model,
+    `Score-based method` = data$score_bin,
+    ` ` = paste(rep(" ", 20), collapse = " "),
+    `P score` = ifelse(is.na(data[[p_cols[1]]]), "", round(as.numeric(data[[p_cols[1]]]), 3)),
+    `LCA-based method` = data$lca_bin,
+    `  ` = paste(rep(" ", 20), collapse = " "),
+    `P LCA` = ifelse(is.na(data[[p_cols[2]]]), "", round(as.numeric(data[[p_cols[2]]]), 3)),
+    Education = data$education_bin,
+    `   ` = paste(rep(" ", 20), collapse = " "),
+    `P education` = ifelse(is.na(data[[p_cols[3]]]), "", round(as.numeric(data[[p_cols[3]]]), 3)),
+    `Household income` = data$income_bin,
+    `    ` = paste(rep(" ", 20), collapse = " "),
+    `P income` = ifelse(is.na(data[[p_cols[4]]]), "", round(as.numeric(data[[p_cols[4]]]), 3)),
+    `Occupation prestige` = data$occupation_bin,
+    `     ` = paste(rep(" ", 20), collapse = " "),
+    `P occupation` = ifelse(is.na(data[[p_cols[5]]]), "", round(as.numeric(data[[p_cols[5]]]), 3)),
+    check.names = FALSE
+  )
+
+  attr(display_data, "hr_values") <- hr_values
+  display_data
+}
+
+plot_age_forest <- function(forest_data, filename) {
+  hr_values <- attr(forest_data, "hr_values")
+  tm <- forest_theme(
+    base_size = 10,
+    refline_col = "black",
+    footnote_gp = gpar(col = "blue"),
+    ci_col = c("#000000")
+  )
+
+  age_forest <- forest(
+    forest_data,
+    est = lapply(hr_values, function(x) x[, 1]),
+    lower = lapply(hr_values, function(x) x[, 2]),
+    upper = lapply(hr_values, function(x) x[, 3]),
+    ci_column = c(3, 6, 9, 12, 15),
+    ref_line = 1,
+    xlim = c(0, 4),
+    ticks_at = c(0, 1, 2, 3, 4),
+    xlab = "Hazard Ratio (95% CI)",
+    theme = tm
+  )
+
+  age_forest <- add_border(age_forest, part = "header")
+  ggsave(age_forest, filename = filename, width = 12, height = 4, dpi = 300)
+  age_forest
+}
+
+age_forest_data <- prepare_age_forest_data(age_subgroup_results)
+age_forest <- plot_age_forest(age_forest_data, "age_subgroup_forest.pdf")
+
+sex_forest_data <- prepare_subgroup_forest_data(sex_subgroup_results)
+sex_forest <- plot_subgroup_forest(sex_forest_data, "sex_subgroup_forest.pdf")
+
+BMI_forest_data <- prepare_subgroup_forest_data(BMI_subgroup)
+BMI_forest <- plot_subgroup_forest(BMI_forest_data, "bmi_subgroup_forest.pdf")
+```
+
+
+# Sensitivity Analyses
+
+```{r sensitivity-analyses}
+# sensitivity analysis ####
+# Exclude cancer diagnosis within 1 year
+# Model 2 score
+sep_score_m2_e1 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 1),])
+# Model 2 lca
+sep_lca_m2_e1 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 1),])
+# Model 2 education
+sep_edu_m2_e1 <- coxph(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 1),])
+# Model 2 income
+sep_inc_m2_e1 <- coxph(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 1),])
+# Model 2 occupation
+sep_occ_m2_e1 <- coxph(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 1),])
+
+model_e1_list <- list(
+  "Score" = sep_score_m2_e1,
+  "LCA" = sep_lca_m2_e1,
+  "Education" = sep_edu_m2_e1,
+  "Income" = sep_inc_m2_e1,
+  "Occupation" = sep_occ_m2_e1
+)
+e1_results <- combine_cox_results(model_e1_list, extract_formatted_hr_ci)
+
+# Exclude cancer diagnosis within 2 year
+# Model 2 score
+sep_score_m2_e2 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 2),])
+# Model 2 lca
+sep_lca_m2_e2 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 2),])
+# Model 2 education
+sep_edu_m2_e2 <- coxph(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 2),])
+# Model 2 income
+sep_inc_m2_e2 <- coxph(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 2),])
+# Model 2 occupation
+sep_occ_m2_e2 <- coxph(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 2),])
+model_e2_list <- list(
+  "Score" = sep_score_m2_e2,
+  "LCA" = sep_lca_m2_e2,
+  "Education" = sep_edu_m2_e2,
+  "Income" = sep_inc_m2_e2,
+  "Occupation" = sep_occ_m2_e2
+)
+e2_results <- combine_cox_results(model_e2_list, extract_formatted_hr_ci)
+
+# Exclude cancer diagnosis within 3 year
+# Model 2 score
+sep_score_m2_e3 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 3),])
+# Model 2 lca
+sep_lca_m2_e3 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 3),])
+# Model 2 education
+sep_edu_m2_e3 <- coxph(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 3),])
+# Model 2 income
+sep_inc_m2_e3 <- coxph(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 3),])
+# Model 2 occupation
+sep_occ_m2_e3 <- coxph(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat,
+                      data = total3[!(total3$tc.case == 1 & total3$fu <= 3),])
+model_e3_list <- list(
+  "Score" = sep_score_m2_e3,
+  "LCA" = sep_lca_m2_e3,
+  "Education" = sep_edu_m2_e3,
+  "Income" = sep_inc_m2_e3,
+  "Occupation" = sep_occ_m2_e3
+)
+e3_results <- combine_cox_results(model_e3_list, extract_formatted_hr_ci)
+
+# Mix model ####
+# Model 3 (use to sensitivity analysis)
+sep_score_m3 <- coxme(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female +  smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      (1 | region_code), data = total3)
+sep_lca_m3 <- coxme(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      (1 | region_code), data = total3)
+sep_edu_m3 <- coxme(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      (1 | region_code), data = total3)
+sep_inc_m3 <- coxme(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      (1 | region_code), data = total3)
+sep_occ_m3 <- coxme(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                      is_female + smoking_category + region_is_urban +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      (1 | region_code), data = total3)
+model_e4_list <- list(
+  "Score" = sep_score_m3,
+  "LCA" = sep_lca_m3,
+  "Education" = sep_edu_m3,
+  "Income" = sep_inc_m3,
+  "Occupation" = sep_occ_m3
+)
+e4_results <- combine_cox_results(model_e4_list, extract_formatted_hr_ci)
+
+# Add alcohol consumption and exercise as covariate
+sep_score_m7 <- coxph(Surv(fu, tc.case) ~ sep_score_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      met.cat,
+                      data = total3)
+sep_lca_m7 <- coxph(Surv(fu, tc.case) ~ sep_lca_cat + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      met.cat,
+                      data = total3)
+sep_edu_m7 <- coxph(Surv(fu, tc.case) ~ education + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      met.cat,
+                      data = total3)
+sep_inc_m7 <- coxph(Surv(fu, tc.case) ~ household_income + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      met.cat,
+                      data = total3)
+sep_occ_m7 <- coxph(Surv(fu, tc.case) ~ occupation + strata(age.ca) +
+                      is_female + region_is_urban + smoking_category +
+                      BMI.cat + fam.ca + marital_status + alcohol.cat +
+                      met.cat,
+                      data = total3)
+model_m7_list <- list(
+  "Score" = sep_score_m7,
+  "LCA" = sep_lca_m7,
+  "Education" = sep_edu_m7,
+  "Income" = sep_inc_m7,
+  "Occupation" = sep_occ_m7
+)
+m7_results <- combine_cox_results(model_m7_list, extract_formatted_hr_ci)
+write.csv(m7_results,
+          "sensitivity_results_add_alcohol_exercise.csv",
+          row.names=F)
+
+sensitivity_results <- rbind(e1_results, e2_results, e3_results, e4_results)
+sensitivity_results <- sensitivity_results %>%
+  add_row(Model = "Exclude cancer diagnosis within 1 year", .before = 1) %>%
+  add_row(Model = "Exclude cancer diagnosis within 2 year", .before = 7) %>%
+  add_row(Model = "Exclude cancer diagnosis within 3 year", .before = 13) %>%
+  add_row(Model = "Add region as random effect", .before = 19)
+write.csv(sensitivity_results,
+          "sensitivity_results_27_10.csv",
+          row.names=F)
+
+```
+
+
+# Regional ASIR, ASMR, and GDP
+
+```{r regional-asdr}
+# Calculate ASDR for each region ####
+total2 <- total2 %>% 
+  mutate(age_endpoint=age_at_study+round(fu,2)) %>%
+  mutate(age.ca3=ifelse(age_endpoint<50,1,
+                        ifelse(age_endpoint<70,2,3)))
+total2$age.ca3 <- as.factor(total2$age.ca3)
+total_12 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(12))
+total_16 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(16))
+total_26 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(26))
+total_36 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(36))
+total_46 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(46))
+total_52 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(52))
+total_58 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(58))
+total_68 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(68))
+total_78 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(78))
+total_88 <- total2[total2$cancer_diag == 0,] %>% subset(region_code %in% c(88))
+result <- data.frame(
+  region = character(),
+  age_group = integer(),
+  person_year = numeric(),
+  disease_cases = integer(),
+  incidence_rate = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Define regions code
+regions <- c(12, 16, 26, 36, 46, 52, 58, 68, 78, 88)
+
+# Iterate through each region and calculate person-year and crude incidence rate
+for (region in regions) {
+  
+  df_name <- paste0("total_", region)
+  df <- get(df_name)
+  
+  # Calculate person-year and incidence rate for the current region for each age group
+  summary_df <- df %>%
+    group_by(age.ca3) %>%
+    summarise(
+      person_year = sum(fu.death),                 
+      disease_cases = sum(ep_range_C73_to__odu_ep),                 
+      incidence_rate = (disease_cases / person_year) * 100000  
+    ) %>%
+    mutate(region = region)  
+  result <- rbind(result, summary_df)
+}
+
+# Load standard population data
+sp <- read.csv("SP.csv", fileEncoding = "UTF-8-BOM")
+result <- cbind(sp,result)
+# Calculate ASIR
+asir_result <- result %>%
+  group_by(region) %>%
+  summarise(
+    total_sp = sum(SP),  # 计算总人口数
+    ASIR = sum((incidence_rate * (SP / total_sp)))  # 计算ASR
+  )
+
+print(asir_result)
+write.csv(asir_result,
+          "asdr_result.csv",
+          row.names=F)
+```
+
+```{r regional-asir-gdp}
+# Calculate ASIR for each region ####
+total3 <- total3 %>% 
+  mutate(age_endpoint=age_at_study+round(fu,2)) %>%
+  mutate(age.ca3=ifelse(age_endpoint<50,1,
+                        ifelse(age_endpoint<70,2,3)))
+total3$age.ca3 <- as.factor(total3$age.ca3)
+total_12 <- total3 %>% subset(region_code %in% c(12))
+total_16 <- total3 %>% subset(region_code %in% c(16))
+total_26 <- total3 %>% subset(region_code %in% c(26))
+total_36 <- total3 %>% subset(region_code %in% c(36))
+total_46 <- total3 %>% subset(region_code %in% c(46))
+total_52 <- total3 %>% subset(region_code %in% c(52))
+total_58 <- total3 %>% subset(region_code %in% c(58))
+total_68 <- total3 %>% subset(region_code %in% c(68))
+total_78 <- total3 %>% subset(region_code %in% c(78))
+total_88 <- total3 %>% subset(region_code %in% c(88))
+result <- data.frame(
+  region = character(),
+  age_group = integer(),
+  person_year = numeric(),
+  disease_cases = integer(),
+  incidence_rate = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Define regions code
+regions <- c(12, 16, 26, 36, 46, 52, 58, 68, 78, 88)
+
+# Iterate through each region and calculate person-year and crude incidence rate
+for (region in regions) {
+  
+  df_name <- paste0("total_", region)
+  df <- get(df_name)
+  
+  # Calculate person-year and incidence rate for the current region for each age group
+  summary_df <- df %>%
+    group_by(age.ca3) %>%
+    summarise(
+      person_year = sum(fu),                 
+      disease_cases = sum(tc.case),                 
+      incidence_rate = (disease_cases / person_year) * 100000  
+    ) %>%
+    mutate(region = region)  
+  result <- rbind(result, summary_df)
+}
+
+# Load standard population data
+sp <- read.csv("SP.csv", fileEncoding = "UTF-8-BOM")
+result <- cbind(sp,result)
+# Calculate ASIR
+asir_result <- result %>%
+  group_by(region) %>%
+  summarise(
+    total_sp = sum(SP),  # 计算总人口数
+    ASIR = sum((incidence_rate * (SP / total_sp)))  # 计算ASR
+  )
+
+print(asir_result)
+write.csv(asir_result,
+          "asir_result.csv",
+          row.names=F)
+region_data <- read.csv("ASR和GDP.csv")
+region_data$region <- str_extract(region_data$Region_code,"(?<=\\().+?(?=\\))")
+region_data$ASIR_log <- log(region_data$ASIR)
+region_data$aGDP_per_capita_log <- log10(region_data$aGDP_per_capita)
+rcorr(as.matrix(region_data[,c(3,4)]),type = c("spearman"))
+# ASIR
+ci_cor(region_data[[3]], region_data[[4]], 
+        method = "spearman",
+        type = "bootstrap",
+        R = 10000,
+        seed = 1190,
+        boot_type = "bca")
+
+# ASMR
+ci_cor(region_data[[3]], region_data[[5]], 
+        method = "spearman",
+        type = "bootstrap",
+        R = 10000,
+        seed = 1190,
+        boot_type = "bca")
+```
+
+```{r regional-map-and-correlation-plots}
+china_maps <- st_read("中华人民共和国.json", quiet = TRUE)
+china_pro <- st_read("中华人民共和国-市.json", quiet = TRUE)
+
+region_data$de_name <- c(
+  "Licang,Qingdao", "Nangang,Harbin", "Meilan,Haikou",
+  "Wuzhong,Suzhou", "Liuzhou", "Pengzhou,Chengdu",
+  "Maiji,Tianshui", "Huixian,Xinxiang", "Tongxiang,Jiaxing",
+  "Liuyang,Changsha"
+)
+region_data$adcode <- c(
+  "370000", "230000", "460000", "320000", "450000",
+  "510000", "620000", "410000", "330000", "430000"
+)
+region_data$area <- c(rep("Urban", 5), rep("Rural", 5))
+
+china_tc_asr <- china_maps %>%
+  left_join(
+    region_data %>%
+      dplyr::select(adcode, ASIR, ASDR, de_name, aGDP_per_capita, area),
+    by = "adcode"
+  )
+
+Changsha <- st_read("长沙市.json", quiet = TRUE)
+Jiaxing <- st_read("嘉兴市.json", quiet = TRUE)
+Xinxiang <- st_read("新乡市.json", quiet = TRUE)
+Tianshui <- st_read("天水市.json", quiet = TRUE)
+Chengdu <- st_read("成都市.json", quiet = TRUE)
+Suzhou <- st_read("苏州市.json", quiet = TRUE)
+Haikou <- st_read("海口市.json", quiet = TRUE)
+Harbin <- st_read("哈尔滨市.json", quiet = TRUE)
+Qingdao <- st_read("青岛市.json", quiet = TRUE)
+
+center_lookup <- tibble::tibble(
+  de_name = c(
+    "Liuzhou", "Licang,Qingdao", "Nangang,Harbin", "Meilan,Haikou",
+    "Wuzhong,Suzhou", "Pengzhou,Chengdu", "Maiji,Tianshui",
+    "Huixian,Xinxiang", "Tongxiang,Jiaxing", "Liuyang,Changsha"
+  ),
+  center_study = as.character(c(
+    china_pro$center[266], Qingdao$center[5], Harbin$center[2],
+    Haikou$center[4], Suzhou$center[2], Chengdu$center[17],
+    Tianshui$center[2], Xinxiang$center[11], Jiaxing$center[7],
+    Changsha$center[8]
+  ))
+)
+
+china_tc_asr <- china_tc_asr %>%
+  left_join(center_lookup, by = "de_name") %>%
+  mutate(
+    center = ifelse(!is.na(center_study), center_study, as.character(center)),
+    center = gsub("c\\(|\\)", "", center)
+  ) %>%
+  separate(center, into = c("longitude", "latitude"), sep = ",", convert = TRUE)
+
+china_tc_asr_points <- st_as_sf(
+  china_tc_asr,
+  coords = c("longitude", "latitude"),
+  crs = 4326,
+  remove = FALSE
+)
+china_tc_asr_points$area <- as.factor(china_tc_asr_points$area)
+
+point_asir <- ggplot() +
+  geom_sf(data = china_tc_asr, fill = "white", color = "black", size = 0.5) +
+  theme_bw() +
+  geom_sf_text(aes(label = de_name), size = 3, color = "black", data = china_tc_asr) +
+  geom_point(
+    data = subset(china_tc_asr_points, !is.na(de_name)),
+    aes(x = longitude, y = latitude, color = area, size = as.numeric(ASIR)),
+    shape = 16
+  ) +
+  scale_color_manual(values = c("Urban" = "#3f34e5ff", "Rural" = "#0ad874ff")) +
+  scale_size_continuous(
+    range = c(3, 8),
+    breaks = c(5, 10, 15),
+    labels = c("5", "10", "15"),
+    name = "ASIR"
+  ) +
+  labs(color = "Area") +
+  coord_sf(xlim = c(72, 142), ylim = c(17, 55.5), expand = FALSE) +
+  annotation_scale()
+
+final_point_asir <- point_asir +
+  annotation_north_arrow(
+    location = "tl",
+    which_north = "true",
+    pad_x = unit(0.1, "in"),
+    pad_y = unit(0.1, "in"),
+    style = north_arrow_nautical(fill = c("black", "white"), line_col = "grey20"),
+    height = unit(2, "cm"),
+    width = unit(2, "cm")
+  ) +
+  coord_sf(xlim = c(72, 142), ylim = c(17, 55.5), expand = FALSE)
+
+clear_plot_d <- ggplot() +
+  geom_sf(data = china_tc_asr, fill = "white", color = "black", size = 0.5) +
+  theme_void() +
+  theme(legend.position = "none", panel.border = element_rect(color = "black", size = 1, fill = NA)) +
+  geom_point(
+    data = subset(china_tc_asr_points, !is.na(de_name)),
+    aes(x = longitude, y = latitude, color = area, size = as.numeric(ASIR)),
+    shape = 16
+  ) +
+  scale_color_manual(values = c("Urban" = "#3f34e5ff", "Rural" = "#0ad874ff")) +
+  scale_size_continuous(
+    range = c(1.5, 4),
+    breaks = c(5, 10, 15),
+    labels = c("5", "10", "15"),
+    name = "ASIR"
+  ) +
+  xlim(107, 122) +
+  ylim(2, 24)
+
+plot_with_inset_point <- final_point_asir +
+  annotation_custom(
+    ggplotGrob(clear_plot_d),
+    xmin = 123,
+    xmax = 138.8,
+    ymin = 13.5,
+    ymax = 27
+  )
+
+ggsave(
+  plot_with_inset_point,
+  filename = "TC_ASIR_map_area.pdf",
+  width = 8,
+  height = 8,
+  dpi = 300
+)
+
+plot_asir <- ggplot(region_data, aes(x = aGDP_per_capita, y = ASIR)) +
+  geom_point(aes(color = area), alpha = 0.7, size = 3) +
+  scale_color_manual(values = c("Urban" = "#3f34e5ff", "Rural" = "#08eb7dff")) +
+  coord_cartesian(xlim = c(min(region_data$aGDP_per_capita), max(region_data$aGDP_per_capita)), ylim = c(0, 40)) +
+  scale_y_continuous(name = "ASIR per 100,000 Person-year", n.breaks = 5) +
+  scale_x_continuous(name = "Average GDP per capita during 2005-2016", n.breaks = 5, labels = comma) +
+  theme_classic() +
+  theme(
+    panel.background = element_rect(fill = "#fefefeff"),
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "none"
+  ) +
+  geom_text_repel(label = region_data$de_name, size = 4, max.overlaps = Inf) +
+  labs(color = "Area", title = "Correlation between GDP per capita and ASIR") +
+  annotate(
+    "text",
+    x = min(region_data$aGDP_per_capita) + 0.1,
+    y = 35,
+    label = "Spearman correlation: \n r = 0.66 \n p = 0.038",
+    hjust = 0,
+    size = 6,
+    fontface = "italic"
+  )
+
+plot_asmr <- ggplot(region_data, aes(x = aGDP_per_capita, y = ASDR)) +
+  geom_point(aes(color = area), alpha = 0.7, size = 3) +
+  scale_color_manual(values = c("Urban" = "#3f34e5ff", "Rural" = "#08eb7dff")) +
+  coord_cartesian(xlim = c(min(region_data$aGDP_per_capita), max(region_data$aGDP_per_capita)), ylim = c(0, 2)) +
+  scale_y_continuous(name = "ASMR per 100,000 Person-year", n.breaks = 5) +
+  scale_x_continuous(name = "Average GDP per capita during 2005-2016", n.breaks = 5, labels = comma) +
+  theme_classic() +
+  theme(
+    panel.background = element_rect(fill = "#fefefeff"),
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  ) +
+  geom_text_repel(label = region_data$de_name, size = 4, max.overlaps = Inf) +
+  labs(color = "Area", title = "Correlation between GDP per capita and ASMR") +
+  annotate(
+    "text",
+    x = min(region_data$aGDP_per_capita) + 0.1,
+    y = 1.75,
+    label = "Spearman correlation: \n r = 0.47 \n p = 0.17",
+    hjust = 0,
+    size = 6,
+    fontface = "italic"
+  )
+
+combined_plots <- plot_asir | plot_asmr
+ggsave(
+  "combined_plots.pdf",
+  plot = combined_plots,
+  width = 18,
+  height = 10,
+  dpi = 300
+)
+```

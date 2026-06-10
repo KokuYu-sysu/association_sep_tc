@@ -1,0 +1,3 @@
+# Code Resource
+
+Here is the code resource for paper "Lin, J., Yang, J., Liang, M., Chen, Y., Huang, W., Wu, L., Chen, X., Vaccarella, S., & Li, M. (2026). Association between Socioeconomic Position and Thyroid Cancer Incidence: A Population-Based Cohort Study in China. *Cancer epidemiology, biomarkers & prevention : a publication of the American Association for Cancer Research, cosponsored by the American Society of Preventive Oncology*, *35*(5), 752–761. https://doi.org/10.1158/1055-9965.EPI-25-1875
